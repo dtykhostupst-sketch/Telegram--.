@@ -1,0 +1,172 @@
+
+const API = (token) => `https://api.telegram.org/bot${token}/`;
+
+async function tg(env, method, data) {
+  const r = await fetch(API(env.BOT_TOKEN) + method, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  });
+  return r.json();
+}
+
+async function getGame(env, chat) {
+  return await env.GAME_DATA.get("game:" + chat, "json") || null;
+}
+
+async function saveGame(env, chat, game) {
+  await env.GAME_DATA.put("game:" + chat, JSON.stringify(game));
+}
+
+async function message(env, chat, text, extra = {}) {
+  return tg(env, "sendMessage", {
+    chat_id: chat,
+    text,
+    ...extra
+  });
+}
+
+async function handleMessage(env, m) {
+  const chat = m.chat.id;
+  const text = (m.text || "").split("@")[0];
+  const user = m.from;
+  const name = user.first_name || "Гравець";
+
+  if (text === "/start") {
+    return message(env, chat,
+      "😁 SMILE GAME\n\n/newgame — почати гру\n/vote — голосувати\n/finish — завершити гру\n\nПід час гри надсилайте фото в чат."
+    );
+  }
+
+  if (text === "/newgame") {
+    await saveGame(env, chat, {
+      owner: user.id,
+      photos: [],
+      voters: {},
+      active: true
+    });
+    return message(env, chat, "🎮 Нова гра розпочалася!\nНадсилайте фото чоловіків у чат.");
+  }
+
+  let game = await getGame(env, chat);
+
+  if (m.photo && game && game.active) {
+    const photo = m.photo[m.photo.length - 1];
+    game.photos.push({
+      id: photo.file_id,
+      user: user.id,
+      name,
+      votes: 0
+    });
+    await saveGame(env, chat, game);
+    return message(env, chat,
+      `📸 Фото додано!\nУсього фото: ${game.photos.length}`
+    );
+  }
+
+  if (text === "/vote") {
+    if (!game || !game.active) {
+      return message(env, chat, "Спочатку розпочніть гру командою /newgame");
+    }
+    if (!game.photos.length) {
+      return message(env, chat, "Поки немає фото. Надішліть перше!");
+    }
+
+    const keyboard = game.photos.map((p, i) => [{
+      text: `Фото №${i + 1}`,
+      callback_data: `vote:${i}`
+    }]);
+
+    return message(env, chat, "👇 Обери фото, за яке голосуєш:", {
+      reply_markup: { inline_keyboard: keyboard }
+    });
+  }
+
+  if (text === "/finish") {
+    if (!game || !game.active) {
+      return message(env, chat, "Активної гри немає.");
+    }
+    if (game.owner !== user.id) {
+      return message(env, chat, "Завершити гру може лише її автор.");
+    }
+
+    game.active = false;
+    await saveGame(env, chat, game);
+
+    const result = [...game.photos].sort((a, b) => b.votes - a.votes);
+    let output = "🏆 РЕЗУЛЬТАТИ ГРИ\n\n";
+
+    result.forEach((p, i) => {
+      output += `${i + 1}. ${p.name} — ${p.votes} голосів\n`;
+    });
+
+    if (!result.length) output += "Фото не було додано.";
+    return message(env, chat, output);
+  }
+}
+
+async function handleCallback(env, q) {
+  const chat = q.message.chat.id;
+  const user = q.from;
+  const index = Number(q.data.split(":")[1]);
+  const game = await getGame(env, chat);
+
+  if (!game || !game.active || !game.photos[index]) {
+    return tg(env, "answerCallbackQuery", {
+      callback_query_id: q.id,
+      text: "Гра вже завершена."
+    });
+  }
+
+  if (game.voters[user.id]) {
+    return tg(env, "answerCallbackQuery", {
+      callback_query_id: q.id,
+      text: "Ти вже проголосував!"
+    });
+  }
+
+  if (game.photos[index].user === user.id) {
+    return tg(env, "answerCallbackQuery", {
+      callback_query_id: q.id,
+      text: "За власне фото голосувати не можна."
+    });
+  }
+
+  game.photos[index].votes++;
+  game.voters[user.id] = true;
+  await saveGame(env, chat, game);
+
+  return tg(env, "answerCallbackQuery", {
+    callback_query_id: q.id,
+    text: "Голос зараховано! ❤️"
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/setup") {
+      const result = await tg(env, "setWebhook", {
+        url: url.origin
+      });
+      return Response.json(result);
+    }
+
+    if (request.method === "POST") {
+      const update = await request.json();
+
+      if (update.message) {
+        await handleMessage(env, update.message);
+      }
+
+      if (update.callback_query) {
+        await handleCallback(env, update.callback_query);
+      }
+
+      return new Response("OK");
+    }
+
+    return new Response("SMILE GAME BOT is running!");
+  }
+};
